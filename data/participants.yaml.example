@@ -1,0 +1,14 @@
+# 参加者名簿のサンプル。実データは data/participants.yaml に置く（.gitignore対象・非公開）。
+# cp data/participants.yaml.example data/participants.yaml してから実データに書き換える。
+
+participants:
+  - name: サンプル太郎
+    device_primary: apple_health
+    dob: "1990-01-01"
+    sex: male
+    drive_report_id: null
+    notes: これはダミーデータ。実際の参加者情報はここに書かない。
+
+drive:
+  root_folder_id: null
+  report_folder_id: null
