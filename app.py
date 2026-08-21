@@ -27,7 +27,9 @@ sys.path.insert(0, str(ROOT))
 
 import ui  # noqa: E402
 from analysis import fatigue_window, metrics, rari, roster  # noqa: E402
-from parsers import apple_health  # noqa: E402
+from parsers import apple_health, mifitness  # noqa: E402
+
+DEVICE_LABELS = {"apple_health": "Apple Health", "mifitness": "MiFitness（Xiaomi/Zepp）"}
 
 PHASE_LABELS = {
     "phase1": "Phase1｜ベースライン測定（1週間）",
@@ -78,12 +80,16 @@ ui.hero(
     title="🩺 健康データ ダッシュボード",
     subtitle="松浦冬馬様フォローアップ分析（2026-08-10）で確立したロジックを社内ツール化したもの。"
     "RHR・HRV・VO<sub>2</sub>Max・歩数・装着ギャップをzip1つで可視化する。",
-    tag="RestAcademy × Apple Health 統合分析ツール",
-    badge="現在 Apple Health のみ対応 ／ MiFitnessは次フェーズ",
+    tag="RestAcademy × Apple Health / MiFitness 統合分析ツール",
+    badge="Apple Health ＋ MiFitness(Xiaomi/Zepp) 対応（2026-08-21〜）",
 )
 
 with st.sidebar:
     st.header("データ投入")
+    device_type = st.radio(
+        "デバイス種別", options=list(DEVICE_LABELS.keys()), format_func=lambda k: DEVICE_LABELS[k],
+        help="松浦様はApple Health、石田様・森田様・田中様はMiFitness（Xiaomiアプリのエクスポート）。",
+    )
     phase_key = st.selectbox(
         "この計測がどのPhaseか",
         options=list(PHASE_LABELS.keys()),
@@ -91,9 +97,16 @@ with st.sidebar:
         help="小松様の運用モデル（レストアカデミー運用ドキュメント）のPhase1〜3。"
         "同じ参加者で複数回アップロードすると、下部の「Phase比較」タブに蓄積される。",
     )
-    uploaded = st.file_uploader("Apple Health エクスポート（.zip / .xml）", type=["zip", "xml"])
+    if device_type == "apple_health":
+        uploaded = st.file_uploader("Apple Health エクスポート（.zip / .xml）", type=["zip", "xml"])
+    else:
+        uploaded = st.file_uploader("MiFitness エクスポート（.zip）", type=["zip"])
     outer_pw = st.text_input("zipパスワード（不要なら空欄）", type="password")
-    st.caption("gigafile等で二重zipになっている場合、内側のzipにも同じパスワードで自動トライする。")
+    st.caption(
+        "gigafile等で二重zipになっている場合、内側のzipにも同じパスワードで自動トライする。"
+        if device_type == "apple_health"
+        else "MiFitnessのエクスポートはパスワード付きが標準。前回のパスワードは使い回せないことが多いので都度確認すること。"
+    )
     if st.session_state.get("phase_results"):
         st.markdown("---")
         st.caption("このセッションで記録済みのPhase:")
@@ -133,49 +146,70 @@ def load_apple_health(xml_bytes: bytes) -> tuple[dict, dict[str, pd.DataFrame], 
 
 
 if uploaded is None:
-    st.info("左のサイドバーからApple Healthのエクスポートファイルをアップロードしてください。")
+    hint = "Apple Health" if device_type == "apple_health" else "MiFitness"
+    st.info(f"左のサイドバーから{hint}のエクスポートファイルをアップロードしてください。")
     st.stop()
 
 work_dir = Path(tempfile.mkdtemp())
-xml_path: Path | None = None
-other_devices: list[str] = []
 
-if uploaded.name.endswith(".xml"):
-    xml_path = work_dir / "export.xml"
-    xml_path.write_bytes(uploaded.getvalue())
-else:
-    outer_path = work_dir / uploaded.name
-    outer_path.write_bytes(uploaded.getvalue())
+if device_type == "mifitness":
+    # ---------------------------------------------------------------------
+    # MiFitness（Xiaomi/Zepp）分岐 — 2026-08-21、田中良美様の実データで確立
+    # ---------------------------------------------------------------------
+    mi_path = work_dir / uploaded.name
+    mi_path.write_bytes(uploaded.getvalue())
     try:
-        with zipfile.ZipFile(outer_path) as zf:
-            pwd = outer_pw.encode() if outer_pw else None
-            zf.extractall(work_dir, pwd=pwd)
+        with st.spinner("MiFitnessデータを解析中..."):
+            mi_data = mifitness.parse_export_zip(mi_path, outer_pw or None)
     except RuntimeError:
-        st.error("zipのパスワードが違う（または未入力）。サイドバーで入力してください。")
+        st.error("zipのパスワードが違う（または未入力）。MiFitnessのパスワードは前回の使い回しができないことが多い。")
         st.stop()
-    except zipfile.BadZipFile:
-        st.error("zipファイルとして開けなかった。ファイルが壊れているか、対応形式ではない。")
+    except ValueError as e:
+        st.error(str(e))
         st.stop()
-    with st.spinner("export.xml を探索中（ネストしたzipも展開）..."):
-        xml_path = find_export_xml(work_dir, outer_pw)
-    other_devices = detect_other_devices(work_dir)
+    me, records, workouts = mi_data.me, mi_data.records, mi_data.workouts
+    info = mifitness.me_summary(me)
+    matched = roster.match_by_mifitness_uid(me.get("uid")) or roster.match_by_dob(info.get("dob"))
+    other_devices: list[str] = []
+else:
+    xml_path: Path | None = None
+    other_devices = []
 
-if other_devices:
-    st.warning(
-        "以下のファイルはMiFitness形式で、本ダッシュボードは現在未対応: "
-        + ", ".join(other_devices)
-        + "。実データのパスワードが解けたら次フェーズで対応する。"
-    )
+    if uploaded.name.endswith(".xml"):
+        xml_path = work_dir / "export.xml"
+        xml_path.write_bytes(uploaded.getvalue())
+    else:
+        outer_path = work_dir / uploaded.name
+        outer_path.write_bytes(uploaded.getvalue())
+        try:
+            with zipfile.ZipFile(outer_path) as zf:
+                pwd = outer_pw.encode() if outer_pw else None
+                zf.extractall(work_dir, pwd=pwd)
+        except RuntimeError:
+            st.error("zipのパスワードが違う（または未入力）。サイドバーで入力してください。")
+            st.stop()
+        except zipfile.BadZipFile:
+            st.error("zipファイルとして開けなかった。ファイルが壊れているか、対応形式ではない。")
+            st.stop()
+        with st.spinner("export.xml を探索中（ネストしたzipも展開）..."):
+            xml_path = find_export_xml(work_dir, outer_pw)
+        other_devices = detect_other_devices(work_dir)
 
-if xml_path is None:
-    st.error("export.xml が見つからなかった。Apple Healthのエクスポートか確認してください。")
-    st.stop()
+    if other_devices:
+        st.warning(
+            "以下のファイルはMiFitness形式：サイドバーの「デバイス種別」をMiFitnessに切り替えて"
+            "このファイルを直接アップロードすれば解析できる: " + ", ".join(other_devices)
+        )
 
-with st.spinner("Apple Health データを解析中（数百MB規模だと数十秒かかる）..."):
-    me, records, workouts = load_apple_health(xml_path.read_bytes())
+    if xml_path is None:
+        st.error("export.xml が見つからなかった。Apple Healthのエクスポートか確認してください。")
+        st.stop()
 
-info = apple_health.me_summary(me)
-matched = roster.match_by_dob(info.get("dob"))
+    with st.spinner("Apple Health データを解析中（数百MB規模だと数十秒かかる）..."):
+        me, records, workouts = load_apple_health(xml_path.read_bytes())
+
+    info = apple_health.me_summary(me)
+    matched = roster.match_by_dob(info.get("dob"))
 
 # ---------------------------------------------------------------------------
 # RARI(日次)＋疲労Window(RFW) 算出、Phase別にセッション内へ蓄積
@@ -395,12 +429,19 @@ with tabs[7]:
         st.info("ワークアウト記録なし")
 
 with tabs[8]:
-    st.caption(
-        "RestAcademy Recovery Index (RARI) v1.0 の日次スコア（身体軸40+脳軸35+時間軸25）。"
-        "元アルゴリズムはXiaomi Mi Fitness実測（連続SpO2・Stress・睡眠段階）を前提にしているため、"
-        "Apple Healthでは取得できない指標（ストレス平均・リラックス%）は中間値で補完している。"
-        "Xiaomi版のRARIスコアと数値を直接比較しないこと。"
-    )
+    uses_real_stress = len(rari_table) and rari_table["mind_axis_confidence"].str.startswith("full").any()
+    if uses_real_stress:
+        st.caption(
+            "RestAcademy Recovery Index (RARI) v1.0 の日次スコア（身体軸40+脳軸35+時間軸25）。"
+            "MiFitness実測のStress Indexを使って脳軸（ストレス平均・リラックス%）を計算している。"
+        )
+    else:
+        st.caption(
+            "RestAcademy Recovery Index (RARI) v1.0 の日次スコア（身体軸40+脳軸35+時間軸25）。"
+            "元アルゴリズムはXiaomi Mi Fitness実測（連続SpO2・Stress・睡眠段階）を前提にしているため、"
+            "Apple Healthでは取得できない指標（ストレス平均・リラックス%）は中間値で補完している。"
+            "Xiaomi版のRARIスコアと数値を直接比較しないこと。"
+        )
     if len(rari_table) == 0:
         st.info("RARIスコア算出に必要なデータ（睡眠・RHR・HRV・歩数のいずれか）が見つからなかった。")
     else:
@@ -479,8 +520,9 @@ with tabs[10]:
         st.caption("※ セッション（ブラウザタブ）を閉じるとこの蓄積は消える。恒久的な比較記録が必要なら次フェーズでDrive保存を実装する。")
 
 st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+_device_label = "Apple Health" if device_type == "apple_health" else "MiFitness（Xiaomi/Zepp）"
 st.markdown(
-    "<div class='ra-footer'>本ツールは自己申告ではなくApple Health実測データに基づく分析。"
+    f"<div class='ra-footer'>本ツールは自己申告ではなく{_device_label}実測データに基づく分析。"
     "医療的診断ではなく、プログラム設計の参考資料として使用すること。</div>",
     unsafe_allow_html=True,
 )

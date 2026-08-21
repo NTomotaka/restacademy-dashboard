@@ -162,6 +162,43 @@ def _score_rhr(rhr: float | None) -> float:
 
 
 # --- 脳軸 (Mind Score, 35pt) ------------------------------------------------
+# Xiaomi Stressの区分は元RARIレポート内の凡例に準拠: <25=リラックス／25-50=ふつう／50-75=高め。
+# 「severe」はそれを超える帯として75以上と定義する（元文書に明示の数値はないため
+# ここは本モジュールでの拡張運用）。
+STRESS_RELAX_THRESHOLD = 25
+STRESS_SEVERE_THRESHOLD = 75
+
+
+def _score_relax_pct(pct: float | None) -> float:
+    if pct is None or pd.isna(pct):
+        return NEUTRAL_RELAX_PCT_PT
+    if pct >= 70:
+        return 15.0
+    if pct >= 60:
+        return _lerp(pct, 60, 11.0, 70, 15.0)
+    if pct >= 50:
+        return _lerp(pct, 50, 7.0, 60, 11.0)
+    if pct < 35:
+        return 1.0
+    return _lerp(pct, 35, 1.0, 50, 7.0)
+
+
+def _score_stress_avg(avg: float | None, severe_pct: float = 0.0) -> float:
+    if avg is None or pd.isna(avg):
+        return NEUTRAL_STRESS_AVG_PT
+    if avg < 25:
+        base = 8.0
+    elif avg < 35:
+        base = _lerp(avg, 25, 8.0, 35, 5.0)
+    elif avg < 50:
+        base = _lerp(avg, 35, 5.0, 50, 2.0)
+    elif avg >= 65:
+        base = 0.5
+    else:
+        base = _lerp(avg, 50, 2.0, 65, 0.5)
+    penalty = min(severe_pct / 5.0, 3.0) if severe_pct else 0.0
+    return max(0.0, base - penalty)
+
 
 def _score_hrv_or_rhr(hrv: float | None, rhr_fallback: float | None) -> float:
     if hrv is not None and not pd.isna(hrv):
@@ -239,13 +276,37 @@ def rank_of(total: float) -> str:
     return "D"
 
 
-def build_daily_table(records: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """participants の Apple Health records から日次RARIテーブルを構築する。
+def _daily_stress_stats(stress_df: pd.DataFrame | None) -> pd.DataFrame:
+    """1日ごとのstress平均・リラックス%・severe%を計算する（MiFitness/Xiaomiのみ存在）。"""
+    if stress_df is None or len(stress_df) == 0:
+        return pd.DataFrame(columns=["date", "avg_stress", "relax_pct", "severe_pct"])
+    d = stress_df.dropna(subset=["startDate", "value"]).copy()
+    d["date"] = d["startDate"].dt.tz_localize(None).dt.date if d["startDate"].dt.tz is not None else d["startDate"].dt.date
 
-    records: apple_health.parse_export_xml() が返す data.records と同じ形。
-    stress/relax（Xiaomi専用）は取得できないため、Apple Health版フォールバックで計算する。
+    def _agg(g):
+        n = len(g)
+        return pd.Series(
+            {
+                "avg_stress": g["value"].mean(),
+                "relax_pct": (g["value"] < STRESS_RELAX_THRESHOLD).sum() / n * 100 if n else np.nan,
+                "severe_pct": (g["value"] > STRESS_SEVERE_THRESHOLD).sum() / n * 100 if n else np.nan,
+            }
+        )
+
+    return d.groupby("date").apply(_agg, include_groups=False).reset_index()
+
+
+def build_daily_table(records: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """participants の records（Apple Health/MiFitness共通形式）から日次RARIテーブルを構築する。
+
+    records: apple_health.parse_export_xml() または mifitness.parse_export_zip() が返す
+    .records と同じ形（キー: rhr/hrv/steps/hr/sleep/spo2/stand_time、任意でstress）。
+    stress/relax（Xiaomi専用）はMiFitness由来なら実測値を使い、Apple Healthのみの場合は
+    フォールバック中間値で計算する。
     """
     nights = sleep_nights(records.get("sleep"))
+    stress_daily = _daily_stress_stats(records.get("stress"))
+    stress_by_date = {r["date"]: r for _, r in stress_daily.iterrows()} if len(stress_daily) else {}
 
     def _daily(df: pd.DataFrame | None, col: str = "value") -> pd.Series:
         if df is None or len(df) == 0:
@@ -272,10 +333,8 @@ def build_daily_table(records: dict[str, pd.DataFrame]) -> pd.DataFrame:
         spo2_min = d.groupby("date")["value"].min()
     stand_daily_min = _daily_sum(records.get("stand_time"))  # 分単位（Apple Health仕様）
 
-    if len(nights) == 0:
-        all_dates = sorted(set(rhr_daily.index) | set(hrv_daily.index) | set(steps_daily.index))
-    else:
-        all_dates = sorted(set(nights["night_date"]) | set(rhr_daily.index) | set(hrv_daily.index) | set(steps_daily.index))
+    base_dates = set(rhr_daily.index) | set(hrv_daily.index) | set(steps_daily.index) | set(stress_by_date.keys())
+    all_dates = sorted(base_dates | set(nights["night_date"])) if len(nights) else sorted(base_dates)
 
     nights_by_date = {r["night_date"]: r for _, r in nights.iterrows()} if len(nights) else {}
 
@@ -306,6 +365,7 @@ def build_daily_table(records: dict[str, pd.DataFrame]) -> pd.DataFrame:
         spo2a = spo2_avg.get(date)
         spo2m = spo2_min.get(date) if len(spo2_min) else None
         stand_h = (stand_daily_min.get(date) / 60.0) if len(stand_daily_min) and stand_daily_min.get(date) is not None else None
+        stress_row = stress_by_date.get(date)
 
         body = (
             _score_sleep_hours(sleep_h)
@@ -313,11 +373,16 @@ def build_daily_table(records: dict[str, pd.DataFrame]) -> pd.DataFrame:
             + _score_spo2(spo2a, spo2m)
             + _score_rhr(rhr)
         )
-        mind = (
-            NEUTRAL_RELAX_PCT_PT  # Xiaomi専用「リラックス%」はApple Healthで取得不可
-            + _score_hrv_or_rhr(hrv, rhr)
-            + NEUTRAL_STRESS_AVG_PT  # Xiaomi専用「ストレス平均」も同様
-        )
+        if stress_row is not None:
+            # MiFitness/Xiaomi実測のStress Indexがある日はそのまま使う（元v1.0の想定どおり）
+            mind = (
+                _score_relax_pct(stress_row["relax_pct"])
+                + _score_hrv_or_rhr(hrv, rhr)
+                + _score_stress_avg(stress_row["avg_stress"], stress_row["severe_pct"])
+            )
+        else:
+            # Apple Healthのみ（Xiaomi実測なし）→ 中間値フォールバック
+            mind = NEUTRAL_RELAX_PCT_PT + _score_hrv_or_rhr(hrv, rhr) + NEUTRAL_STRESS_AVG_PT
         time_axis = (
             _score_bedtime_timing(bedtime)
             + _score_bedtime_consistency(std_hours, n_nights)
@@ -340,7 +405,12 @@ def build_daily_table(records: dict[str, pd.DataFrame]) -> pd.DataFrame:
                 "rhr": rhr,
                 "hrv": hrv,
                 "steps": steps,
-                "mind_axis_confidence": "reduced（Xiaomi専用のstress/relax%は未取得。Apple Health中間値フォールバック適用）",
+                "avg_stress": round(stress_row["avg_stress"], 1) if stress_row is not None else None,
+                "mind_axis_confidence": (
+                    "full（MiFitness/Xiaomi実測のStress Indexを使用）"
+                    if stress_row is not None
+                    else "reduced（Xiaomi専用のstress/relax%は未取得。Apple Health中間値フォールバック適用）"
+                ),
             }
         )
 
