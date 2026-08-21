@@ -26,8 +26,15 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import ui  # noqa: E402
-from analysis import metrics, roster  # noqa: E402
+from analysis import fatigue_window, metrics, rari, roster  # noqa: E402
 from parsers import apple_health  # noqa: E402
+
+PHASE_LABELS = {
+    "phase1": "Phase1｜ベースライン測定（1週間）",
+    "phase2": "Phase2｜マイクロブレイク介入（1週間）",
+    "phase3": "Phase3｜教育介入後・再測定",
+    "unspecified": "指定なし（単発解析）",
+}
 
 st.set_page_config(page_title="RestAcademy 健康データダッシュボード", page_icon="🩺", layout="wide")
 ui.inject_css()
@@ -77,9 +84,21 @@ ui.hero(
 
 with st.sidebar:
     st.header("データ投入")
+    phase_key = st.selectbox(
+        "この計測がどのPhaseか",
+        options=list(PHASE_LABELS.keys()),
+        format_func=lambda k: PHASE_LABELS[k],
+        help="小松様の運用モデル（レストアカデミー運用ドキュメント）のPhase1〜3。"
+        "同じ参加者で複数回アップロードすると、下部の「Phase比較」タブに蓄積される。",
+    )
     uploaded = st.file_uploader("Apple Health エクスポート（.zip / .xml）", type=["zip", "xml"])
     outer_pw = st.text_input("zipパスワード（不要なら空欄）", type="password")
     st.caption("gigafile等で二重zipになっている場合、内側のzipにも同じパスワードで自動トライする。")
+    if st.session_state.get("phase_results"):
+        st.markdown("---")
+        st.caption("このセッションで記録済みのPhase:")
+        for k, v in st.session_state["phase_results"].items():
+            st.caption(f"✅ {PHASE_LABELS.get(k, k)} — {v['name']}（{v['n_days']}日分・平均RARI {v['avg_rari']:.1f}）")
 
 
 def find_export_xml(root: Path, password: str) -> Path | None:
@@ -157,6 +176,25 @@ with st.spinner("Apple Health データを解析中（数百MB規模だと数十
 
 info = apple_health.me_summary(me)
 matched = roster.match_by_dob(info.get("dob"))
+
+# ---------------------------------------------------------------------------
+# RARI(日次)＋疲労Window(RFW) 算出、Phase別にセッション内へ蓄積
+# ---------------------------------------------------------------------------
+with st.spinner("RARIスコア・疲労Windowを算出中..."):
+    rari_table = rari.build_daily_table(records)
+    fw_result = fatigue_window.detect_fatigue_windows(records.get("hr"), records.get("steps"))
+
+if "phase_results" not in st.session_state:
+    st.session_state["phase_results"] = {}
+if len(rari_table):
+    st.session_state["phase_results"][phase_key] = {
+        "name": matched["name"] if matched else "（新規/未照合）",
+        "n_days": int(len(rari_table)),
+        "avg_rari": float(rari_table["rari"].mean()),
+        "date_range": (str(rari_table["date"].min()), str(rari_table["date"].max())),
+        "rari_table": rari_table,
+        "fw_result": fw_result,
+    }
 
 # ---------------------------------------------------------------------------
 # 参加者ヘッダー
@@ -243,7 +281,10 @@ st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 # ---------------------------------------------------------------------------
 # タブ構成
 # ---------------------------------------------------------------------------
-tab_names = ["RHR", "HRV", "歩数", "VO2Max", "装着ギャップ", "1日の流れ", "曜日×時間帯", "睡眠・ワークアウト"]
+tab_names = [
+    "RHR", "HRV", "歩数", "VO2Max", "装着ギャップ", "1日の流れ", "曜日×時間帯", "睡眠・ワークアウト",
+    "RARIスコア(日次)", "疲労Window(RFW)", "Phase比較",
+]
 tabs = st.tabs(tab_names)
 
 with tabs[0]:
@@ -352,6 +393,90 @@ with tabs[7]:
         st.dataframe(workouts.sort_values("startDate", ascending=False), use_container_width=True)
     else:
         st.info("ワークアウト記録なし")
+
+with tabs[8]:
+    st.caption(
+        "RestAcademy Recovery Index (RARI) v1.0 の日次スコア（身体軸40+脳軸35+時間軸25）。"
+        "元アルゴリズムはXiaomi Mi Fitness実測（連続SpO2・Stress・睡眠段階）を前提にしているため、"
+        "Apple Healthでは取得できない指標（ストレス平均・リラックス%）は中間値で補完している。"
+        "Xiaomi版のRARIスコアと数値を直接比較しないこと。"
+    )
+    if len(rari_table) == 0:
+        st.info("RARIスコア算出に必要なデータ（睡眠・RHR・HRV・歩数のいずれか）が見つからなかった。")
+    else:
+        recent = rari_table.tail(90)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=recent["date"], y=recent["rari"], mode="lines+markers",
+                                  line=dict(color=NAVY, width=2), name="RARI"))
+        fig.add_hrect(y0=80, y1=100, fillcolor=MOSS, opacity=0.08, line_width=0, annotation_text="Aランク")
+        fig.add_hrect(y0=65, y1=80, fillcolor=TEAL, opacity=0.06, line_width=0, annotation_text="Bランク")
+        fig.update_layout(height=380, yaxis_title="RARI /100", margin=dict(t=20))
+        st.plotly_chart(ui.plotly_theme(fig), use_container_width=True)
+        st.caption(f"直近90日。平均 {recent['rari'].mean():.1f}点 ／ 最高 {recent['rari'].max():.1f}点 ／ 最低 {recent['rari'].min():.1f}点")
+        st.dataframe(
+            rari_table.sort_values("date", ascending=False)
+            [["date", "rari", "rank", "body", "mind", "time", "sleep_hours", "bedtime", "rhr", "hrv", "steps"]]
+            .head(60),
+            use_container_width=True,
+        )
+
+with tabs[9]:
+    st.caption(
+        "RestAcademy Fatigue Window（RFW）v0.1 — 小松様提案の運用モデルドキュメントに基づく新規アルゴリズム。"
+        "「本人の直近7日ベースラインよりHRが高い」×「同時刻の歩数がほぼゼロ」が重なる時間帯を検出する。"
+        "就寝〜早朝（既定0-6時）は運動・起床時の生理的なHR変動と混同しやすいため除外している。"
+    )
+    if fw_result.get("insufficient_data"):
+        st.warning(f"疲労Windowの判定を保留：{fw_result.get('reason')}")
+    else:
+        st.write(f"心拍記録がある日数: {fw_result['days_covered']}日")
+        top = fatigue_window.top_fatigue_windows(fw_result["hourly_summary"])
+        if not top:
+            st.info("明確な疲労Windowの再現パターンは検出されなかった（フラグ率30%以上の時間帯なし）。")
+        else:
+            rows = "".join(
+                f"<li><b>{t['time']}頃</b>（{t['flag_rate']:.0f}%の日で検出・n={t['n']}）</li>" for t in top
+            )
+            ui.card(
+                "⏰ 疲労Window候補（マイクロブレイク導入の目安時刻）",
+                f"<ul>{rows}</ul><p style='margin-top:8px;color:#777;'>フラグ率＝この時間帯で"
+                "「HR上昇×低活動」が同時に起きた日の割合。サンプル数(n)が少ない時間帯は参考値として扱うこと。</p>",
+                tone="amber",
+            )
+        hs = fw_result["hourly_summary"]
+        if len(hs):
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=hs["hour_bin"], y=hs["flag_rate"] * 100, marker_color=RUST))
+            fig.update_layout(height=360, xaxis_title="時刻(JST)", yaxis_title="疲労フラグ率(%)", margin=dict(t=20))
+            st.plotly_chart(ui.plotly_theme(fig), use_container_width=True)
+
+with tabs[10]:
+    st.caption("同じ参加者について、このセッション内でPhase1/2/3としてアップロードした結果を並べて比較する。")
+    stored = st.session_state.get("phase_results", {})
+    ordered = [k for k in ["phase1", "phase2", "phase3", "unspecified"] if k in stored]
+    if len(ordered) < 2:
+        st.info(
+            "比較にはPhaseを2つ以上アップロードする必要がある。左のサイドバーでPhaseを切り替えて"
+            "次の期間のファイルをアップロードすると、ここに並んで表示される。"
+        )
+    else:
+        cols = st.columns(len(ordered))
+        for col, k in zip(cols, ordered):
+            v = stored[k]
+            with col:
+                st.markdown(f"**{PHASE_LABELS.get(k, k)}**")
+                st.metric("平均RARI", f"{v['avg_rari']:.1f}")
+                st.caption(f"{v['date_range'][0]} 〜 {v['date_range'][1]}（{v['n_days']}日）")
+                fw = v["fw_result"]
+                if not fw.get("insufficient_data"):
+                    top = fatigue_window.top_fatigue_windows(fw["hourly_summary"], top_n=3)
+                    if top:
+                        st.caption("疲労Window: " + " / ".join(t["time"] for t in top))
+                    else:
+                        st.caption("疲労Window: 明確なパターンなし")
+                else:
+                    st.caption(f"疲労Window: 判定保留（{fw.get('reason', '')}）")
+        st.caption("※ セッション（ブラウザタブ）を閉じるとこの蓄積は消える。恒久的な比較記録が必要なら次フェーズでDrive保存を実装する。")
 
 st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 st.markdown(

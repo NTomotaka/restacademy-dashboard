@@ -23,7 +23,13 @@ TARGET_TYPES = {
     "HKQuantityTypeIdentifierAppleExerciseTime": "exercise_time",
     "HKQuantityTypeIdentifierAppleWalkingSteadiness": "walking_steadiness",
     "HKQuantityTypeIdentifierSixMinuteWalkTestDistance": "six_min_walk",
+    # 2026-08-21 RARI v1.0（[[project_restacademy_rari_monitoring]]）実装のため追加
+    "HKQuantityTypeIdentifierOxygenSaturation": "spo2",
+    "HKQuantityTypeIdentifierAppleStandTime": "stand_time",
 }
+
+# 値が「カテゴリ文字列」であり数値化してはいけない指標（sleepの睡眠段階など）
+CATEGORICAL_TYPES = {"sleep"}
 
 
 @dataclass
@@ -94,7 +100,15 @@ def parse_export_xml(path: str, progress_cb=None) -> AppleHealthData:
         df = pd.DataFrame(data)
         if len(df):
             df["startDate"] = pd.to_datetime(df["startDate"], format="mixed")
-            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df["endDate"] = pd.to_datetime(df["endDate"], format="mixed")
+            df["duration_min"] = (df["endDate"] - df["startDate"]).dt.total_seconds() / 60.0
+            if key in CATEGORICAL_TYPES:
+                # sleepはHKCategoryValueSleepAnalysis*の文字列（段階名）なので数値化しない。
+                # 2026-08-21以前は全指標を pd.to_numeric していたため睡眠段階情報が
+                # 無条件にNaN化して失われていた（RARI実装で発覚・修正）。
+                pass
+            else:
+                df["value"] = pd.to_numeric(df["value"], errors="coerce")
         records[key] = df
 
     workouts = pd.DataFrame(workout_rows)
